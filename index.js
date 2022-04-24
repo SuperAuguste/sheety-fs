@@ -70,88 +70,164 @@ const fs = fatfs.createFileSystem({
 //     console.log(err);
 // });
 
-const path = require("path");
-const FtpSrv = require('ftp-srv');
+const nodePath = require("path");
+const webdav = require('webdav-server').v2;
 
-const port = 21;
-const ftpServer = new FtpSrv({
-    url: "ftp://localhost:" + port,
-    anonymous: true
-});
+// function pathify(path) {
+//     return nodePath.posix.join("/", ...path.paths);
+// }
 
-const WIN_SEP_REGEX = /\\/g;
-class SheetyFS extends FtpSrv.FileSystem {
-    resPath(p) {
-        return path.posix.join("/", p);
-    }
+const locks = {};
 
-    get(fileName) {
-        console.log("AAAA",  this._resolvePath(fileName));
-        const p = this.resPath(fileName);
-        console.log("!! Getting", p);
-        return new Promise(resolve => {
-            fs.stat(p, (err, stats) => {
-                if (err && err.code === "ISDIR") resolve({name: fileName, isDirectory() {return true;}});
-                resolve({name: path.basename(fileName), ...stats});
-            });
-        });
-    }
-
-    list(ftpPath = '.') {
-        const z = this;
-        const p = this.resPath(ftpPath);
-        console.log("!! Listing", p);
-        return new Promise(resolve => {
-            fs.readdir(p, async (err, files) => {
-                resolve(Promise.all(files.map(_ => z.get(path.posix.join(p, _)))));
-            });
-        });
-    }
-
-    chdir(path = '.') {
-        
-    }
-
-    write(fileName, { append = false, start = undefined } = {}) {
-        
-    }
-
-    read(fileName, { start = 0 } = {}) {
-        const p = this.resPath(fileName);
-        console.log("!! Listing", p);
-        // return new Promise(resolve => {
-            // fs.createReadStream(p, async (err, files) => {
-            //     resolve(Promise.all(files.map(_ => z.get(path.posix.join(p, _)))));
-            // });
-        // });
-        return fs.createReadStream(p, {start});
-    }
-
-    delete(path) {
-        
-    }
-
-    mkdir(path) {
-        
-    }
-
-    rename(from, to) {
-        
-    }
-
-    chmod(path, mode) {
-
+class Resource
+{
+    constructor(data)
+    {
+        if(!data)
+        {
+            this.props = new webdav.LocalPropertyManager();
+            this.locks = new webdav.LocalLockManager();
+        }
+        else
+        {
+            const rs = data;
+            this.props = rs.props;
+            this.locks = rs.locks;
+        }
     }
 }
 
-ftpServer.on('login', (data, resolve, reject) => {
-    if (data.username === 'anonymous' && data.password === '@anonymous') {
-        return resolve({ root: "/", fs: new SheetyFS() });
+class SheetySerializer {
+    uid()
+    {
+        return 'SheetySerializer_1.0.0';
     }
-    return reject('Invalid username or password');
+
+    serialize(fs, callback)
+    {
+        callback(null, {
+            resources: fs.resources,
+            config: fs.config
+        });
+    }
+
+    unserialize(serializedData, callback)
+    {
+        const fs = new SheetyFS(serializedData.config);
+        fs.resources = serializedData.resources;
+        callback(null, fs);
+    }
+}
+
+class SheetyFS extends webdav.FileSystem {
+    constructor(config)
+    {
+        super(new SheetySerializer());
+
+        this.resources = {
+            '/': new Resource()
+        };
+    }
+
+    /**
+     * @override
+    */
+    _type(path, ctx, callback) {
+        console.log("_type", path.toString());
+        if(path.isRoot())
+            return callback(null, webdav.ResourceType.Directory);
+
+        fs.stat(path.toString(), (err, stats) => {
+            if (err && err.code === "ISDIR") callback(null, webdav.ResourceType.Directory);
+            else if (err) callback(webdav.Errors.ResourceNotFound);
+            else callback(null, webdav.ResourceType.File);
+        });
+    }
+
+    /**
+     * @override
+    */
+    _propertyManager(path, ctx, callback) {
+        console.log("_propMan", path.toString());
+        
+        let resource = this.resources[path.toString()];
+        if(!resource)
+        {
+            resource = new Resource();
+            this.resources[path.toString()] = resource;
+        }
+        callback(null, resource.props);
+    }
+
+    /**
+     * @override
+    */
+    _lockManager(path, ctx, callback) {
+        console.log("_lockMan", path.toString());
+
+        let resource = this.resources[path.toString()];
+        if(!resource)
+        {
+            resource = new Resource();
+            this.resources[path.toString()] = resource;
+        }
+        callback(null, resource.locks);
+    }
+
+    _readDir(path, ctx, callback) {
+        console.log("_readDir", path.toString());
+
+        fs.readdir(path.toString(), async (err, files) => {
+            callback(err, files);
+        });
+    }
+
+    _openReadStream(path, ctx, callback) {
+        console.log("_readStream", path.toString());
+
+        callback(null, fs.createReadStream(path.toString(), {}));
+    }
+
+    _openWriteStream(path, ctx, callback) {
+        console.log("_writeStream", path.toString());
+
+        callback(null, fs.createWriteStream(path.toString(), {}));
+    }
+
+    _create(path, ctx, callback) {
+        console.log("_create", path.toString());
+
+        if (ctx.type.isDirectory)
+            fs.mkdir(path.toString(), callback);
+        else
+            callback(null, fs.createWriteStream(path.toString(), {}));
+    }
+}
+
+// http://localhost:1900
+const server = new webdav.WebDAVServer({
+    port: 1900,
+    autoLoad: {
+        // [...]
+        serializers: [
+            new SheetySerializer()
+        ]
+    }
 });
 
-ftpServer.listen().then(() => {
-    console.log('Ftp server is starting...')
+server.afterRequest((arg, next) => {
+    // Display the method, the URI, the returned status code and the returned message
+    console.log('>>', arg.request.method, arg.requested.uri, '>', arg.response.statusCode, arg.response.statusMessage);
+    // If available, display the body of the response
+    console.log(arg.responseBody);
+    next();
 });
 
+server.autoLoad((e) => {
+    if(!e)
+        return;
+    
+    server.setFileSystem('/', new SheetyFS());
+});
+ 
+server.start(() => console.log('READY'));
